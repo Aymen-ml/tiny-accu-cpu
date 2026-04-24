@@ -7,7 +7,17 @@ from cocotb.triggers import ClockCycles, RisingEdge, Timer
 
 
 def _cpu(dut):
-    return dut.user_project.u_cpu_top
+    try:
+        return dut.user_project.u_cpu_top
+    except AttributeError:
+        try:
+            return dut.user_project
+        except AttributeError:
+            return dut
+
+
+async def settle():
+    await Timer(5, unit="ns")
 
 
 async def reset_dut(dut):
@@ -17,45 +27,52 @@ async def reset_dut(dut):
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 4)
     dut.rst_n.value = 1
-    await Timer(1, unit="ns")
+    await settle()
 
 
 async def wait_for_fetch_phase(dut):
     while fetch_from_debug(dut) != 1:
         await RisingEdge(dut.clk)
+        await settle()
 
 
 async def wait_for_exec_phase(dut):
     while fetch_from_debug(dut) != 0:
         await RisingEdge(dut.clk)
+        await settle()
 
 
 async def run_instr(dut, instr):
     # Align to fetch so instr_i is latched into IR before its execute phase.
     await wait_for_fetch_phase(dut)
     dut.ui_in.value = instr
+    await settle()
     await RisingEdge(dut.clk)  # fetch edge: IR <= ui_in
+    await settle()
     await RisingEdge(dut.clk)  # exec edge: instruction executes
-    await Timer(1, unit="ns")
+    await settle()
 
 
 async def enter_exec_with_instr(dut, instr):
     # Load instr on a fetch edge, then wait until the FSM is in execute.
     await wait_for_fetch_phase(dut)
     dut.ui_in.value = instr
+    await settle()
     await RisingEdge(dut.clk)
     await wait_for_exec_phase(dut)
-    await Timer(1, unit="ns")
+    await settle()
 
 
 async def enter_exec_with_opcode(dut, instr, expected_opcode):
     # Robustly align to EXEC for the intended instruction decode.
     await wait_for_fetch_phase(dut)
     dut.ui_in.value = instr
+    await settle()
     for _ in range(6):
         await RisingEdge(dut.clk)
-        await Timer(1, unit="ns")
-        if fetch_from_debug(dut) == 0 and int(_cpu(dut).opcode.value) == expected_opcode:
+        await settle()
+        cpu = _cpu(dut)
+        if fetch_from_debug(dut) == 0 and hasattr(cpu, "opcode") and int(cpu.opcode.value) == expected_opcode:
             return
     raise AssertionError("Failed to reach EXEC with expected opcode")
 
@@ -84,38 +101,47 @@ async def test_project(dut):
 
     # LDI 5 -> ACC = 5
     await run_instr(dut, 0x05)
+    await settle()
     assert int(dut.uo_out.value) == 5
 
     # STO 1 -> RAM[1] = 5
     await run_instr(dut, 0x31)
+    await settle()
     assert int(dut.uo_out.value) == 5
 
     # LDI 3 -> ACC = 3
     await run_instr(dut, 0x03)
+    await settle()
     assert int(dut.uo_out.value) == 3
 
     # ADD 1 -> ACC = 3 + RAM[1] = 8
     await run_instr(dut, 0x11)
+    await settle()
     assert int(dut.uo_out.value) == 8
 
     # SUB 1 -> ACC = 8 - RAM[1] = 3
     await run_instr(dut, 0x21)
+    await settle()
     assert int(dut.uo_out.value) == 3
 
     # LDM 1 -> ACC = RAM[1] = 5
     await run_instr(dut, 0x41)
+    await settle()
     assert int(dut.uo_out.value) == 5
 
     # Create zero then verify conditional jump modifies PC nibble on debug bus.
     await run_instr(dut, 0x05)  # LDI 5
     await run_instr(dut, 0x21)  # SUB 1 -> ACC = 0
+    await settle()
     assert int(dut.uo_out.value) == 0
 
     await run_instr(dut, 0x5A)  # JMPZ A
+    await settle()
     assert (int(dut.uio_out.value) & 0x0F) == 0x0A
 
     # NOP keeps ACC unchanged.
     await run_instr(dut, 0xF0)
+    await settle()
     assert int(dut.uo_out.value) == 0
 
 
@@ -128,16 +154,17 @@ async def test_reset_and_phase_toggling(dut):
     await reset_dut(dut)
 
     # Reset defaults through top-level observability.
+    await settle()
     assert int(dut.uo_out.value) == 0
     assert pc_from_debug(dut) == 0
 
     # Fetch flag should toggle each cycle in steady state.
     first = fetch_from_debug(dut)
     await RisingEdge(dut.clk)
-    await Timer(1, unit="ns")
+    await settle()
     second = fetch_from_debug(dut)
     await RisingEdge(dut.clk)
-    await Timer(1, unit="ns")
+    await settle()
     third = fetch_from_debug(dut)
 
     assert second != first
@@ -152,6 +179,10 @@ async def test_control_decode_signals(dut):
 
     await reset_dut(dut)
     cpu = _cpu(dut)
+
+    if not hasattr(cpu, "acc_we"):
+        dut._log.warning("Skipping internal decode assertions in GLS: internal control signals are not exposed")
+        return
 
     # LDI: latch IR in fetch, then verify EXEC decode signals.
     await enter_exec_with_opcode(dut, 0x07, 0x0)
@@ -181,14 +212,17 @@ async def test_leaf_modules_simple(dut):
     await run_instr(dut, 0x31)  # STO 1
     await run_instr(dut, 0x03)  # LDI 3
     await run_instr(dut, 0x11)  # ADD 1 -> 8
+    await settle()
     assert int(dut.uo_out.value) == 8
 
     # ALU sub path check: ACC should return to 3.
     await run_instr(dut, 0x21)  # SUB 1 -> 3
+    await settle()
     assert int(dut.uo_out.value) == 3
 
     # Memory read path check.
     await run_instr(dut, 0x41)  # LDM 1 -> 5
+    await settle()
     assert int(dut.uo_out.value) == 5
 
     # Register write gating via ena=0: state/output should hold.
@@ -196,5 +230,6 @@ async def test_leaf_modules_simple(dut):
     hold_acc = int(dut.uo_out.value)
     hold_pc = pc_from_debug(dut)
     await ClockCycles(dut.clk, 4)
+    await settle()
     assert int(dut.uo_out.value) == hold_acc
     assert pc_from_debug(dut) == hold_pc
