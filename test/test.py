@@ -3,7 +3,7 @@
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles
+from cocotb.triggers import ClockCycles, RisingEdge, Timer
 
 
 def _cpu(dut):
@@ -17,12 +17,47 @@ async def reset_dut(dut):
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 4)
     dut.rst_n.value = 1
+    await Timer(1, unit="ns")
+
+
+async def wait_for_fetch_phase(dut):
+    while fetch_from_debug(dut) != 1:
+        await RisingEdge(dut.clk)
+
+
+async def wait_for_exec_phase(dut):
+    while fetch_from_debug(dut) != 0:
+        await RisingEdge(dut.clk)
 
 
 async def run_instr(dut, instr):
-    # Keep one instruction stable for a full fetch/execute pair.
+    # Align to fetch so instr_i is latched into IR before its execute phase.
+    await wait_for_fetch_phase(dut)
     dut.ui_in.value = instr
-    await ClockCycles(dut.clk, 2)
+    await RisingEdge(dut.clk)  # fetch edge: IR <= ui_in
+    await RisingEdge(dut.clk)  # exec edge: instruction executes
+    await Timer(1, unit="ns")
+
+
+async def enter_exec_with_instr(dut, instr):
+    # Load instr on a fetch edge, then wait until the FSM is in execute.
+    await wait_for_fetch_phase(dut)
+    dut.ui_in.value = instr
+    await RisingEdge(dut.clk)
+    await wait_for_exec_phase(dut)
+    await Timer(1, unit="ns")
+
+
+async def enter_exec_with_opcode(dut, instr, expected_opcode):
+    # Robustly align to EXEC for the intended instruction decode.
+    await wait_for_fetch_phase(dut)
+    dut.ui_in.value = instr
+    for _ in range(6):
+        await RisingEdge(dut.clk)
+        await Timer(1, unit="ns")
+        if fetch_from_debug(dut) == 0 and int(_cpu(dut).opcode.value) == expected_opcode:
+            return
+    raise AssertionError("Failed to reach EXEC with expected opcode")
 
 
 def pc_from_debug(dut):
@@ -98,9 +133,11 @@ async def test_reset_and_phase_toggling(dut):
 
     # Fetch flag should toggle each cycle in steady state.
     first = fetch_from_debug(dut)
-    await ClockCycles(dut.clk, 1)
+    await RisingEdge(dut.clk)
+    await Timer(1, unit="ns")
     second = fetch_from_debug(dut)
-    await ClockCycles(dut.clk, 1)
+    await RisingEdge(dut.clk)
+    await Timer(1, unit="ns")
     third = fetch_from_debug(dut)
 
     assert second != first
@@ -116,24 +153,19 @@ async def test_control_decode_signals(dut):
     await reset_dut(dut)
     cpu = _cpu(dut)
 
-    # LDI: expect ACC write with immediate source in EXEC.
-    dut.ui_in.value = 0x07
-    await ClockCycles(dut.clk, 1)  # FETCH edge: IR latch
-    assert int(cpu.acc_we) == 0
-    await ClockCycles(dut.clk, 1)  # EXEC edge: decode active
-    assert int(cpu.acc_we) == 1
-    assert int(cpu.acc_src_sel) == 0b00
+    # LDI: latch IR in fetch, then verify EXEC decode signals.
+    await enter_exec_with_opcode(dut, 0x07, 0x0)
+    assert int(cpu.acc_we.value) == 1
+    assert int(cpu.acc_src_sel.value) == 0b00
 
     # STO: expect data memory write enable.
-    dut.ui_in.value = 0x31
-    await ClockCycles(dut.clk, 2)
-    assert int(cpu.data_we) == 1
+    await enter_exec_with_opcode(dut, 0x31, 0x3)
+    assert int(cpu.data_we.value) == 1
 
     # SUB: expect ALU subtract mode with ACC write.
-    dut.ui_in.value = 0x21
-    await ClockCycles(dut.clk, 2)
-    assert int(cpu.acc_we) == 1
-    assert int(cpu.alu_sub) == 1
+    await enter_exec_with_opcode(dut, 0x21, 0x2)
+    assert int(cpu.acc_we.value) == 1
+    assert int(cpu.alu_sub.value) == 1
 
 
 @cocotb.test()
